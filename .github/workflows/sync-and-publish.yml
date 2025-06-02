@@ -12,7 +12,7 @@ on:
       - master
 
 jobs:
-  sync:
+  sync_and_publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -41,26 +41,9 @@ jobs:
         run: |
           echo "::error::Failed to sync with upstream. Please check the logs."
 
-  publish:
-    runs-on: ubuntu-latest
-    needs: sync
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Buf
-        uses: bufbuild/buf-setup-action@v1
+      - uses: bufbuild/buf-action@v1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      # - name: Lint Protos
-      #   uses: bufbuild/buf-lint-action@v1
-
-      - name: Push to Registry
-        uses: bufbuild/buf-push-action@v1
-        with:
-          buf_token: ${{ secrets.BUF_TOKEN }}
-          draft: false
+          token: ${{ secrets.BUF_TOKEN }}
 
       - name: Handle errors
         if: failure()
