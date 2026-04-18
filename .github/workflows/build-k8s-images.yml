@@ -1,0 +1,420 @@
+name: Build Kubernetes Images
+
+# This workflow builds provider-independent Ubuntu images with the chosen
+# Kubernetes distribution (kubeadm, k3s, k0s) plus multiple container runtimes
+# (runc, gvisor/runsc, kata-containers, wasmtime, wasmedge), Longhorn/Rook-Ceph
+# storage prerequisites, and etcd backup scripts pre-installed.
+#
+# Build strategy (no KVM required):
+#   1. Download Ubuntu cloud image (qcow2) — provides kernel, bootloader, modules
+#   2. Expand and mount via qemu-nbd
+#   3. Build .github/images/Dockerfile with Docker and export the container
+#      filesystem, overlaying it onto the mounted cloud image root partition
+#   4. Seal the image (clear machine-id, SSH host keys, cloud-init state)
+#   5. Compress to qcow2 and publish to GitHub Releases
+#   6. Smoke-test the image by mounting it and verifying installed binaries
+#
+# Images are published per (K8s minor version × distribution) combination.
+# Runtime-specific config is provided as cloud-init userData at boot time.
+
+on:
+  push:
+    branches:
+      - main
+      - copilot/create-dynamic-contabo-images
+    paths:
+      - '.github/images/**'
+      - '.github/workflows/build-k8s-images.yml'
+  workflow_dispatch:
+    inputs:
+      kubernetes_versions:
+        description: >
+          Override the K8s minor versions to build (space-separated, e.g.
+          "v1.29 v1.30 v1.31 v1.32 v1.33"). Leave blank to auto-detect the
+          last 5 released minor versions.
+        required: false
+        default: ''
+      distros:
+        description: >
+          Override the distributions to build (space-separated, e.g.
+          "kubeadm k3s k0s"). Defaults to all three.
+        required: false
+        default: ''
+      ubuntu_version:
+        description: >
+          Override the Ubuntu base image version (e.g. 22.04, 24.04). Leave blank
+          to automatically use the latest Ubuntu LTS release.
+        required: false
+        default: ''
+  schedule:
+    # Rebuild on the 1st of every month to pick up package updates
+    - cron: '0 0 1 * *'
+
+# Only one run per ref at a time to avoid uploading conflicting release assets
+concurrency:
+  group: build-k8s-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. Build the dynamic matrix from workflow inputs
+  # ──────────────────────────────────────────────
+  setup-matrix:
+    name: Setup build matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      ubuntu_version: ${{ steps.detect-ubuntu.outputs.ubuntu_version }}
+
+    steps:
+      - name: Detect latest Ubuntu LTS version
+        id: detect-ubuntu
+        env:
+          UBUNTU_VERSION_OVERRIDE: ${{ github.event.inputs.ubuntu_version }}
+        run: |
+          if [ -n "${UBUNTU_VERSION_OVERRIDE}" ]; then
+            UBUNTU_VERSION="${UBUNTU_VERSION_OVERRIDE}"
+          else
+            # Method 1: use ubuntu-distro-info (pre-installed on GitHub-hosted Ubuntu runners)
+            if command -v ubuntu-distro-info >/dev/null 2>&1; then
+              UBUNTU_VERSION=$(ubuntu-distro-info --lts --release 2>/dev/null \
+                | grep -oP '^\d+\.\d+' | sort -V | tail -1 || true)
+            fi
+            # Method 2: query cloud-images.ubuntu.com directory listing
+            # Ubuntu LTS releases always have an even year and ".04" suffix
+            # (e.g. 20.04, 22.04, 24.04, 26.04 …)
+            if [ -z "${UBUNTU_VERSION}" ]; then
+              UBUNTU_VERSION=$(curl -fsSL "https://cloud-images.ubuntu.com/releases/" 2>/dev/null \
+                | grep -oP 'href="\K[0-9]+\.[0-9]+(?=/)' \
+                | awk -F'.' '$2 == "04" { year = $1 + 0; if (year % 2 == 0) print }' \
+                | sort -V \
+                | tail -1 || true)
+            fi
+            # Fallback to known latest LTS if both methods fail
+            if [ -z "${UBUNTU_VERSION}" ]; then
+              UBUNTU_VERSION="24.04"
+              echo "WARNING: Could not auto-detect Ubuntu LTS version, falling back to ${UBUNTU_VERSION}"
+            fi
+          fi
+          echo "ubuntu_version=${UBUNTU_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Using Ubuntu version: ${UBUNTU_VERSION}"
+
+      - name: Resolve matrix (K8s versions × distributions)
+        id: set-matrix
+        env:
+          K8S_VERSIONS_OVERRIDE: ${{ github.event.inputs.kubernetes_versions }}
+          DISTROS_OVERRIDE: ${{ github.event.inputs.distros }}
+        run: |
+          if [ -n "$K8S_VERSIONS_OVERRIDE" ]; then
+            # Manual override supplied via workflow_dispatch input
+            VERSIONS_JSON=$(echo "$K8S_VERSIONS_OVERRIDE" \
+              | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -sc .)
+          else
+            # Auto-detect: fetch the current stable release and derive the last 5 minor versions
+            STABLE=$(curl -fsSL https://dl.k8s.io/release/stable.txt)   # e.g. v1.32.3
+            MINOR=$(echo "$STABLE" | grep -oP '(?<=v1\.)\d+')            # e.g. 32
+            VERSIONS_JSON=$(seq $((MINOR - 4)) "$MINOR" \
+              | awk '{printf "\"v1.%s\"\n", $1}' \
+              | jq -sc .)                                                 # ["v1.28","v1.29",...]
+          fi
+
+          if [ -n "$DISTROS_OVERRIDE" ]; then
+            DISTROS_JSON=$(echo "$DISTROS_OVERRIDE" \
+              | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -sc .)
+          else
+            DISTROS_JSON='["kubeadm","k3s","k0s"]'
+          fi
+
+          MATRIX=$(jq -cn \
+            --argjson versions "$VERSIONS_JSON" \
+            --argjson distros  "$DISTROS_JSON" \
+            '{k8s_version: $versions, distro: $distros}')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Resolved matrix: $MATRIX"
+
+  # ──────────────────────────────────────────────
+  # 2. Build pre-installed image per (version, distro)
+  # ──────────────────────────────────────────────
+  build-image:
+    name: "K8s ${{ matrix.k8s_version }} / ${{ matrix.distro }}"
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for creating/updating GitHub Releases
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      fail-fast: false
+
+    env:
+      K8S_VERSION: ${{ matrix.k8s_version }}
+      K8S_DISTRO: ${{ matrix.distro }}
+      UBUNTU_VERSION: ${{ needs.setup-matrix.outputs.ubuntu_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Build tools ───────────────────────────────────────────────────────
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-utils cloud-guest-utils
+
+      # ── Download Ubuntu base image ────────────────────────────────────────
+      - name: Download Ubuntu cloud image
+        run: |
+          UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/releases/${UBUNTU_VERSION}/release/ubuntu-${UBUNTU_VERSION}-server-cloudimg-amd64.img"
+          echo "Downloading: ${UBUNTU_IMAGE_URL}"
+          wget -q --show-progress -O /tmp/base.img "${UBUNTU_IMAGE_URL}"
+          qemu-img info /tmp/base.img
+
+      # ── Expand, mount, chroot, install ───────────────────────────────────
+      - name: Expand image to 10 GB
+        run: qemu-img resize /tmp/base.img 10G
+
+      - name: Mount image via qemu-nbd
+        run: |
+          sudo modprobe nbd max_part=8
+          sudo qemu-nbd --connect=/dev/nbd0 /tmp/base.img
+          sleep 2
+          sudo partprobe /dev/nbd0
+          sleep 1
+
+          # Ubuntu cloud images use /dev/nbd0p1 as the root ext4 partition.
+          # Verify this before proceeding.
+          if ! sudo blkid /dev/nbd0p1 | grep -q 'TYPE="ext4"'; then
+            echo "ERROR: /dev/nbd0p1 is not ext4. Partition layout:"
+            sudo lsblk /dev/nbd0
+            exit 1
+          fi
+
+          # Grow partition and filesystem to fill the expanded virtual disk
+          sudo growpart /dev/nbd0 1
+          sudo e2fsck -f -y /dev/nbd0p1 || true
+          sudo resize2fs /dev/nbd0p1
+
+          # Mount root filesystem
+          sudo mount /dev/nbd0p1 /mnt
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg K8S_VERSION="${K8S_VERSION}" \
+            --build-arg K8S_DISTRO="${K8S_DISTRO}" \
+            --build-arg UBUNTU_VERSION="${UBUNTU_VERSION}" \
+            --tag "k8s-image:${K8S_DISTRO}-${K8S_VERSION}" \
+            "${GITHUB_WORKSPACE}/.github/images/"
+
+      - name: Overlay K8s software into mounted rootfs
+        run: |
+          # Export the Docker container filesystem and overlay it onto the
+          # mounted Ubuntu cloud image root partition.
+          # The cloud image provides the bootloader, kernel, and kernel modules;
+          # we preserve those by excluding /boot, /lib/modules, and /lib/firmware.
+          # We also exclude /etc/fstab and /etc/netplan (cloud-image-specific
+          # partition labels and DHCP network config must not be overwritten).
+          CID=$(docker create "k8s-image:${K8S_DISTRO}-${K8S_VERSION}")
+          docker export "${CID}" | sudo tar -x -C /mnt \
+            --exclude=./proc \
+            --exclude=./sys \
+            --exclude=./dev \
+            --exclude=./run \
+            --exclude=./boot \
+            --exclude='./lib/modules' \
+            --exclude='./lib/firmware' \
+            --exclude=./etc/fstab \
+            --exclude=./etc/netplan
+          docker rm "${CID}"
+          docker rmi "k8s-image:${K8S_DISTRO}-${K8S_VERSION}"
+
+      # ── Seal the image ────────────────────────────────────────────────────
+      - name: Seal image (generalize for cloning)
+        run: |
+          # Clear machine-specific state so each instance gets a fresh identity.
+          # systemd regenerates machine-id and SSH host keys on first boot.
+          sudo rm -f  /mnt/etc/machine-id
+          sudo touch  /mnt/etc/machine-id        # empty file → regenerated at boot
+          sudo rm -f  /mnt/var/lib/dbus/machine-id
+          sudo rm -f  /mnt/etc/ssh/ssh_host_*    # SSH host keys regenerated at boot
+
+          # Wipe logs and temp files accumulated during the build
+          sudo find /mnt/var/log -type f -delete 2>/dev/null || true
+          sudo rm -rf /mnt/tmp/*
+          sudo rm -f  /mnt/root/.bash_history
+          sudo find /mnt/home -name '.bash_history' -delete 2>/dev/null || true
+
+          # Reset cloud-init state so it runs on first boot, applying the
+          # runtime cloud-config (userData) provided at instance creation time.
+          sudo rm -rf /mnt/var/lib/cloud/*
+
+      # ── Unmount ───────────────────────────────────────────────────────────
+      - name: Unmount image
+        if: always()
+        run: |
+          set +e
+          sudo umount /mnt         2>/dev/null || true
+          sudo qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true
+          set -e
+
+      # ── Compress and publish ──────────────────────────────────────────────
+      - name: Compress image
+        run: |
+          IMAGE_FILENAME="${K8S_DISTRO}-${K8S_VERSION}.qcow2"
+          echo "Converting and compressing image…"
+          qemu-img convert -c -O qcow2 /tmp/base.img "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
+          ls -lh "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
+          echo "IMAGE_FILENAME=${IMAGE_FILENAME}" >> "$GITHUB_ENV"
+
+      - name: Publish image to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_TAG="k8s-images"
+
+          # Create the release if it does not yet exist
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo  "$GITHUB_REPOSITORY" \
+              --title "Pre-built Kubernetes images" \
+              --notes "Provider-independent Ubuntu images with multiple K8s distributions and container runtimes." \
+              --prerelease
+          fi
+
+          # Upload asset, overwriting any previous version for this combination
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
+
+          IMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${IMAGE_FILENAME}"
+          echo "IMAGE_URL=${IMAGE_URL}" >> "$GITHUB_ENV"
+          echo "Image published at: ${IMAGE_URL}"
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### \`${IMAGE_FILENAME}\`"
+            echo ""
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Distribution | \`${K8S_DISTRO}\` |"
+            echo "| Kubernetes   | \`${K8S_VERSION}\` |"
+            echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
+            echo "| Image URL    | ${IMAGE_URL:-N/A} |"
+            echo ""
+            echo "**Pre-installed runtimes:** runc, gvisor (runsc), kata-containers, wasmtime, wasmedge"
+            echo ""
+            echo "**Storage prerequisites:** lvm2, cryptsetup, open-iscsi, nfs-common (Longhorn + Rook/Ceph ready)"
+            echo ""
+            echo "**etcd tools:** backup + restore scripts pre-installed at /usr/local/bin/ (activate daily cron via cloud-init on control-plane nodes)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────
+  # 3. Smoke-test: mount the released image and verify installed software
+  # ──────────────────────────────────────────────
+  smoke-test:
+    name: "Smoke test ${{ matrix.k8s_version }} / ${{ matrix.distro }}"
+    needs: [setup-matrix, build-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      fail-fast: false
+
+    env:
+      K8S_VERSION: ${{ matrix.k8s_version }}
+      K8S_DISTRO: ${{ matrix.distro }}
+      UBUNTU_VERSION: ${{ needs.setup-matrix.outputs.ubuntu_version }}
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-utils
+
+      - name: Download image from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IMAGE_FILENAME="${K8S_DISTRO}-${K8S_VERSION}.qcow2"
+          IMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/k8s-images/${IMAGE_FILENAME}"
+          echo "Downloading ${IMAGE_URL}"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/octet-stream" \
+               -L "${IMAGE_URL}" -o /tmp/test.qcow2
+          qemu-img info /tmp/test.qcow2
+
+      - name: Mount image and run smoke tests
+        run: |
+          sudo modprobe nbd max_part=8
+          sudo qemu-nbd --connect=/dev/nbd0 /tmp/test.qcow2
+          sleep 2
+          sudo partprobe /dev/nbd0
+          sleep 1
+
+          sudo mount /dev/nbd0p1 /mnt
+          echo "Image mounted. Running smoke tests for distro=${K8S_DISTRO} k8s=${K8S_VERSION}…"
+
+          PASS=0
+          FAIL=0
+          check() {
+            local desc="$1"; local cmd="$2"
+            if eval "$cmd" > /dev/null 2>&1; then
+              echo "  ✅ $desc"
+              PASS=$((PASS+1))
+            else
+              echo "  ❌ $desc"
+              FAIL=$((FAIL+1))
+            fi
+          }
+
+          # ── Container runtimes ────────────────────────────────────────────
+          check "containerd shim (runc)"          "test -f /mnt/usr/bin/containerd-shim-runc-v2 || test -f /mnt/usr/local/bin/containerd-shim-runc-v2 || find /mnt -name containerd-shim-runc-v2 | grep -q ."
+          check "gvisor runsc"                    "find /mnt -name runsc -o -name containerd-shim-runsc-v1 | grep -q ."
+          check "kata-containers shim"            "test -f /mnt/usr/local/bin/containerd-shim-kata-v2 || test -f /mnt/opt/kata/bin/containerd-shim-kata-v2"
+          check "wasmtime or wasmedge shim"       "find /mnt/usr/local/bin -name 'containerd-shim-wasm*' | grep -q ."
+
+          # ── Kubernetes distribution ───────────────────────────────────────
+          case "${K8S_DISTRO}" in
+            kubeadm)
+              check "kubeadm binary"   "test -f /mnt/usr/bin/kubeadm"
+              check "kubectl binary"   "test -f /mnt/usr/bin/kubectl"
+              check "kubelet binary"   "test -f /mnt/usr/bin/kubelet"
+              check "containerd.io"    "find /mnt -path '*/bin/containerd' | grep -q ."
+              ;;
+            k3s)
+              check "k3s binary"       "test -f /mnt/usr/local/bin/k3s"
+              ;;
+            k0s)
+              check "k0s binary"       "test -f /mnt/usr/local/bin/k0s"
+              ;;
+          esac
+
+          # ── Storage prerequisites ─────────────────────────────────────────
+          check "lvm2 (lvs)"          "test -f /mnt/sbin/lvs || find /mnt -name lvs | grep -q ."
+          check "cryptsetup"          "find /mnt -name cryptsetup | grep -q ."
+          check "iscsid"              "find /mnt -name iscsid | grep -q ."
+
+          # ── etcd tools ────────────────────────────────────────────────────
+          check "etcd-backup.sh"      "test -x /mnt/usr/local/bin/etcd-backup.sh"
+          check "etcd-restore.sh"     "test -x /mnt/usr/local/bin/etcd-restore.sh"
+
+          # ── Kernel config ─────────────────────────────────────────────────
+          check "k8s modules-load.d"  "test -f /mnt/etc/modules-load.d/k8s.conf"
+          check "k8s sysctl"          "test -f /mnt/etc/sysctl.d/k8s.conf"
+
+          echo ""
+          echo "Smoke test results: ${PASS} passed, ${FAIL} failed"
+          [ "${FAIL}" -eq 0 ] || exit 1
+
+      - name: Unmount image
+        if: always()
+        run: |
+          set +e
+          sudo umount /mnt 2>/dev/null || true
+          sudo qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true

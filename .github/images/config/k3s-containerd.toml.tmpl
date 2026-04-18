@@ -1,0 +1,9 @@
+{{ template "base" . }}
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+  runtime_type = "io.containerd.kata.v2"
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.wasmtime]
+  runtime_type = "io.containerd.wasmtime.v1"
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.wasmedge]
+  runtime_type = "io.containerd.wasmedge.v1"
