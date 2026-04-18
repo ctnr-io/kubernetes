@@ -199,8 +199,11 @@ jobs:
           sudo mount /dev/nbd0p1 /mnt
 
       - name: Build Docker image
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker build \
+            --secret id=github_token,env=GITHUB_TOKEN \
             --build-arg K8S_VERSION="${K8S_VERSION}" \
             --build-arg K8S_DISTRO="${K8S_DISTRO}" \
             --build-arg UBUNTU_VERSION="${UBUNTU_VERSION}" \

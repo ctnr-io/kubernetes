@@ -73,8 +73,16 @@ RUN curl -fsSL https://gvisor.dev/archive.key | \
     rm -rf /var/lib/apt/lists/*
 
 # ── Kata Containers (hardware-isolated sandbox, requires nested virt) ──────────
-RUN set -eu; \
-    KATA_RELEASE=$(curl -fsSL "https://api.github.com/repos/kata-containers/kata-containers/releases/latest"); \
+RUN --mount=type=secret,id=github_token \
+    set -eu; \
+    GH_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
+    if [ -n "${GH_TOKEN}" ]; then \
+      KATA_RELEASE=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest"); \
+    else \
+      KATA_RELEASE=$(curl -fsSL \
+        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest"); \
+    fi; \
     KATA_VERSION=$(echo "$KATA_RELEASE" | jq -r '.tag_name'); \
     KATA_URL=$(echo "$KATA_RELEASE" | jq -r \
       '.assets[] | select(.name | test("kata-static-.*-amd64\\.tar\\.(xz|zst)$")) | .browser_download_url' \
@@ -92,8 +100,16 @@ RUN set -eu; \
     ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
 
 # ── WASM runtimes (wasmtime and wasmedge via containerd/runwasi) ───────────────
-RUN set -eu; \
-    RUNWASI_RELEASE=$(curl -fsSL https://api.github.com/repos/containerd/runwasi/releases/latest); \
+RUN --mount=type=secret,id=github_token \
+    set -eu; \
+    GH_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
+    if [ -n "${GH_TOKEN}" ]; then \
+      RUNWASI_RELEASE=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+        "https://api.github.com/repos/containerd/runwasi/releases/latest"); \
+    else \
+      RUNWASI_RELEASE=$(curl -fsSL \
+        "https://api.github.com/repos/containerd/runwasi/releases/latest"); \
+    fi; \
     for SHIM in wasmtime wasmedge; do \
       URL=$(echo "$RUNWASI_RELEASE" | jq -r --arg shim "$SHIM" \
         '.assets[] | select(.name | test("containerd-shim-" + $shim + ".*linux.*amd64\\.tar\\.gz$")) | .browser_download_url' \
@@ -130,7 +146,9 @@ RUN if [ "${K8S_DISTRO}" = "kubeadm" ]; then \
 # ── Kubernetes distribution ────────────────────────────────────────────────────
 # k3s uses a containerd config template merged at startup to register extra runtimes.
 COPY config/k3s-containerd.toml.tmpl /tmp/k3s-containerd.toml.tmpl
-RUN set -eu; \
+RUN --mount=type=secret,id=github_token \
+    set -eu; \
+    GH_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
     case "${K8S_DISTRO}" in \
     \
     kubeadm) \
@@ -147,7 +165,13 @@ RUN set -eu; \
       ;; \
     \
     k3s) \
-      K3S_VERSION=$(curl -fsSL "https://api.github.com/repos/k3s-io/k3s/releases" | \
+      if [ -n "${GH_TOKEN}" ]; then \
+        K3S_RELEASES=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+          "https://api.github.com/repos/k3s-io/k3s/releases"); \
+      else \
+        K3S_RELEASES=$(curl -fsSL "https://api.github.com/repos/k3s-io/k3s/releases"); \
+      fi; \
+      K3S_VERSION=$(echo "${K3S_RELEASES}" | \
         jq -r --arg prefix "${K8S_VERSION}." \
           '[.[] | select(.tag_name | startswith($prefix)) | select(.prerelease == false)] | .[0].tag_name // empty'); \
       if [ -z "${K3S_VERSION}" ]; then \
@@ -161,7 +185,13 @@ RUN set -eu; \
       ;; \
     \
     k0s) \
-      K0S_VERSION=$(curl -fsSL "https://api.github.com/repos/k0sproject/k0s/releases" | \
+      if [ -n "${GH_TOKEN}" ]; then \
+        K0S_RELEASES=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+          "https://api.github.com/repos/k0sproject/k0s/releases"); \
+      else \
+        K0S_RELEASES=$(curl -fsSL "https://api.github.com/repos/k0sproject/k0s/releases"); \
+      fi; \
+      K0S_VERSION=$(echo "${K0S_RELEASES}" | \
         jq -r --arg prefix "${K8S_VERSION}." \
           '[.[] | select(.tag_name | startswith($prefix)) | select(.prerelease == false)] | .[0].tag_name // empty'); \
       if [ -z "${K0S_VERSION}" ]; then \
