@@ -73,31 +73,28 @@ RUN curl -fsSL https://gvisor.dev/archive.key | \
     rm -rf /var/lib/apt/lists/*
 
 # ── Kata Containers (hardware-isolated sandbox, requires nested virt) ──────────
-RUN --mount=type=secret,id=github_token \
-    set -eu; \
-    GH_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
-    if [ -n "${GH_TOKEN}" ]; then \
-      KATA_RELEASE=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest" \
-        | tr -d '\000-\037'); \
-    else \
-      KATA_RELEASE=$(curl -fsSL \
-        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest" \
-        | tr -d '\000-\037'); \
-    fi; \
-    KATA_VERSION=$(echo "$KATA_RELEASE" | jq -r '.tag_name'); \
-    KATA_URL=$(echo "$KATA_RELEASE" | jq -r \
-      '.assets[] | select(.name | test("kata-static-.*-amd64\\.tar\\.(xz|zst)$")) | .browser_download_url' \
-      | head -1); \
-    [ -n "${KATA_URL}" ] || { \
-      echo "ERROR: kata-containers amd64 static tarball not found in release ${KATA_VERSION}" >&2; \
+# Use the GitHub web redirect to discover the latest version instead of parsing
+# the releases API JSON, which often contains control characters in the release
+# body that cause jq to exit with a parse error (exit code 5).
+RUN set -eu; \
+    KATA_VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+      "https://github.com/kata-containers/kata-containers/releases/latest" \
+      | sed 's|.*/||'); \
+    [ -n "${KATA_VERSION}" ] || { \
+      echo "ERROR: could not determine kata-containers latest version" >&2; \
       exit 1; \
     }; \
     echo "Installing Kata Containers ${KATA_VERSION}..."; \
-    if echo "${KATA_URL}" | grep -q '\.tar\.zst'; then \
-      curl -fsSL "${KATA_URL}" | tar --zstd -xf - -C /; \
+    BASE_URL="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}"; \
+    ZST_NAME="kata-static-${KATA_VERSION}-amd64.tar.zst"; \
+    XZ_NAME="kata-static-${KATA_VERSION}-amd64.tar.xz"; \
+    if curl --head -fsSL "${BASE_URL}/${ZST_NAME}" > /dev/null 2>&1; then \
+      curl -fsSL "${BASE_URL}/${ZST_NAME}" | tar --zstd -xf - -C /; \
+    elif curl --head -fsSL "${BASE_URL}/${XZ_NAME}" > /dev/null 2>&1; then \
+      curl -fsSL "${BASE_URL}/${XZ_NAME}" | tar -xJf - -C /; \
     else \
-      curl -fsSL "${KATA_URL}" | tar -xJf - -C /; \
+      echo "ERROR: kata-containers amd64 static tarball not found for ${KATA_VERSION}" >&2; \
+      exit 1; \
     fi; \
     ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
 
