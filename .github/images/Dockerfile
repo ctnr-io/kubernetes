@@ -78,10 +78,12 @@ RUN --mount=type=secret,id=github_token \
     GH_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
     if [ -n "${GH_TOKEN}" ]; then \
       KATA_RELEASE=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest"); \
+        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest" \
+        | tr -d '\000-\037'); \
     else \
       KATA_RELEASE=$(curl -fsSL \
-        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest"); \
+        "https://api.github.com/repos/kata-containers/kata-containers/releases/latest" \
+        | tr -d '\000-\037'); \
     fi; \
     KATA_VERSION=$(echo "$KATA_RELEASE" | jq -r '.tag_name'); \
     KATA_URL=$(echo "$KATA_RELEASE" | jq -r \
@@ -105,10 +107,12 @@ RUN --mount=type=secret,id=github_token \
     GH_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
     if [ -n "${GH_TOKEN}" ]; then \
       RUNWASI_RELEASE=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-        "https://api.github.com/repos/containerd/runwasi/releases/latest"); \
+        "https://api.github.com/repos/containerd/runwasi/releases/latest" \
+        | tr -d '\000-\037'); \
     else \
       RUNWASI_RELEASE=$(curl -fsSL \
-        "https://api.github.com/repos/containerd/runwasi/releases/latest"); \
+        "https://api.github.com/repos/containerd/runwasi/releases/latest" \
+        | tr -d '\000-\037'); \
     fi; \
     for SHIM in wasmtime wasmedge; do \
       URL=$(echo "$RUNWASI_RELEASE" | jq -r --arg shim "$SHIM" \
@@ -167,9 +171,11 @@ RUN --mount=type=secret,id=github_token \
     k3s) \
       if [ -n "${GH_TOKEN}" ]; then \
         K3S_RELEASES=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-          "https://api.github.com/repos/k3s-io/k3s/releases"); \
+          "https://api.github.com/repos/k3s-io/k3s/releases" \
+          | tr -d '\000-\037'); \
       else \
-        K3S_RELEASES=$(curl -fsSL "https://api.github.com/repos/k3s-io/k3s/releases"); \
+        K3S_RELEASES=$(curl -fsSL "https://api.github.com/repos/k3s-io/k3s/releases" \
+          | tr -d '\000-\037'); \
       fi; \
       K3S_VERSION=$(echo "${K3S_RELEASES}" | \
         jq -r --arg prefix "${K8S_VERSION}." \
@@ -187,9 +193,11 @@ RUN --mount=type=secret,id=github_token \
     k0s) \
       if [ -n "${GH_TOKEN}" ]; then \
         K0S_RELEASES=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-          "https://api.github.com/repos/k0sproject/k0s/releases"); \
+          "https://api.github.com/repos/k0sproject/k0s/releases" \
+          | tr -d '\000-\037'); \
       else \
-        K0S_RELEASES=$(curl -fsSL "https://api.github.com/repos/k0sproject/k0s/releases"); \
+        K0S_RELEASES=$(curl -fsSL "https://api.github.com/repos/k0sproject/k0s/releases" \
+          | tr -d '\000-\037'); \
       fi; \
       K0S_VERSION=$(echo "${K0S_RELEASES}" | \
         jq -r --arg prefix "${K8S_VERSION}." \
