@@ -1,10 +1,10 @@
 #!/bin/bash
 # etcd snapshot backup — pre-baked into the K8s node image.
 # Run as root on a control-plane node.
-# Certificate paths and data directory are resolved at image build time.
+# Certificate paths and storage directories are resolved at image build time.
 set -euo pipefail
 
-BACKUP_DIR="/var/lib/etcd/backup"
+BACKUP_DIR="${ETCD_BACKUP_DIR}"
 BACKUP_DATE=$(date +%Y%m%d-%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/etcd-snapshot-$BACKUP_DATE.db"
 
@@ -12,10 +12,10 @@ mkdir -p "$BACKUP_DIR"
 echo "Creating etcd snapshot: $BACKUP_FILE"
 
 ETCDCTL_API=3 etcdctl \
-  --endpoints=https://127.0.0.1:2379 \
-  --cacert=${ETCD_CA_FILE} \
-  --cert=${ETCD_CERT_FILE} \
-  --key=${ETCD_KEY_FILE} \
+  --endpoints="https://127.0.0.1:2379" \
+  --cacert="${ETCD_CA_FILE}" \
+  --cert="${ETCD_CERT_FILE}" \
+  --key="${ETCD_KEY_FILE}" \
   snapshot save "$BACKUP_FILE"
 
 # Keep only the 5 most recent snapshots

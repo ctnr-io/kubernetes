@@ -6,16 +6,16 @@
 set -euo pipefail
 
 [ -z "${1:-}" ] && { echo "Usage: $0 <backup-file>"; exit 1; }
-[ ! -f "$1"   ] && { echo "ERROR: Backup file '$1' does not exist"; exit 1; }
+[ ! -f "$1" ] && { echo "ERROR: Backup file '$1' does not exist"; exit 1; }
 
 echo "Restoring etcd from: $1"
-systemctl stop ${K8S_SERVICE} || true
-rm -rf ${ETCD_DATA_DIR}
+systemctl stop "${K8S_SERVICE}" || true
+rm -rf "${ETCD_DATA_DIR}"
 
 ETCDCTL_API=3 etcdctl snapshot restore "$1" \
-  --data-dir=${ETCD_DATA_DIR} \
+  --data-dir="${ETCD_DATA_DIR}" \
   --name="$(hostname)" \
   --initial-cluster="$(hostname)=https://localhost:2380" \
-  --initial-advertise-peer-urls=https://localhost:2380
+  --initial-advertise-peer-urls="https://localhost:2380"
 
 echo "Etcd restore completed. Start ${K8S_SERVICE} to rejoin the cluster."
