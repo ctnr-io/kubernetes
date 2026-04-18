@@ -252,6 +252,21 @@ jobs:
           # runtime cloud-config (userData) provided at instance creation time.
           sudo rm -rf /mnt/var/lib/cloud/*
 
+      # ── Zero-fill free space for better compression ───────────────────────
+      # Filling free ext4 blocks with zeros allows qemu-img convert -c to
+      # compress the entire free region to nearly nothing (zeros compress
+      # extremely well with ZLIB). Without this step, uninitialised ext4
+      # blocks look like random data and compress poorly, making the resulting
+      # qcow2 several gigabytes larger than necessary.
+      - name: Zero-fill free space
+        run: |
+          # fstrim may report "operation not supported" on NBD — that's OK.
+          sudo fstrim -v /mnt 2>/dev/null || true
+          # dd exits non-zero when the disk fills completely — that is the goal.
+          sudo dd if=/dev/zero of=/mnt/ZERO bs=4M status=none 2>/dev/null || true
+          sudo sync
+          sudo rm -f /mnt/ZERO
+
       # ── Unmount ───────────────────────────────────────────────────────────
       - name: Unmount image
         if: always()
