@@ -91,10 +91,6 @@ RUN curl -fsSL https://gvisor.dev/archive.key | \
 # Use the GitHub web redirect to discover the latest version instead of parsing
 # the releases API JSON, which often contains control characters in the release
 # body that cause jq to exit with a parse error (exit code 5).
-# After extracting the tarball we keep only the containerd shim and kata-runtime
-# binaries. The rest of the static bundle (QEMU, virtiofsd, rootfs images) adds
-# ~450 MB and is only needed on KVM-capable nodes; those can run kata-deploy to
-# install the full bundle at boot time.
 RUN set -eu; \
     KATA_VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
       "https://github.com/kata-containers/kata-containers/releases/latest" \
@@ -115,9 +111,7 @@ RUN set -eu; \
       echo "ERROR: kata-containers amd64 static tarball not found for ${KATA_VERSION}" >&2; \
       exit 1; \
     fi; \
-    ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2; \
-    find /opt/kata -mindepth 1 -maxdepth 1 ! -name 'bin' -exec rm -rf {} + || true; \
-    find /opt/kata/bin -mindepth 1 ! -name 'containerd-shim-kata-v2' ! -name 'kata-runtime' -delete || true
+    ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
 
 # ── WASM runtimes (wasmtime and wasmedge via containerd/runwasi) ───────────────
 RUN --mount=type=secret,id=github_token \
