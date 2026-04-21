@@ -515,7 +515,7 @@ jobs:
           }
 
           # ── Container runtimes ────────────────────────────────────────────
-          check "containerd shim (runc)"          "test -f /mnt/usr/bin/containerd-shim-runc-v2 || test -f /mnt/usr/local/bin/containerd-shim-runc-v2 || find /mnt -name containerd-shim-runc-v2 | grep -q ."
+          # gvisor/runsc is pre-installed in all distros
           check "gvisor runsc"                    "find /mnt -name runsc -o -name containerd-shim-runsc-v1 | grep -q ."
           check "runtime install script"          "test -x /mnt/usr/local/bin/k8s-runtime-install.sh"
           check "runtime install service enabled" "test -L /mnt/etc/systemd/system/multi-user.target.wants/k8s-runtime-install.service"
@@ -523,16 +523,20 @@ jobs:
           # ── Kubernetes distribution ───────────────────────────────────────
           case "${DISTRO}" in
             kubeadm)
-              check "kubeadm binary"   "test -f /mnt/usr/bin/kubeadm"
-              check "kubectl binary"   "test -f /mnt/usr/bin/kubectl"
-              check "kubelet binary"   "test -f /mnt/usr/bin/kubelet"
-              check "containerd.io"    "find /mnt -path '*/bin/containerd' | grep -q ."
+              # kubeadm uses containerd.io which ships containerd-shim-runc-v2 as a separate binary
+              check "containerd shim (runc)"  "find /mnt -name containerd-shim-runc-v2 | grep -q ."
+              check "kubeadm binary"          "test -f /mnt/usr/bin/kubeadm"
+              check "kubectl binary"          "test -f /mnt/usr/bin/kubectl"
+              check "kubelet binary"          "test -f /mnt/usr/bin/kubelet"
+              check "containerd.io"           "find /mnt -path '*/bin/containerd' | grep -q ."
               ;;
             k3s)
-              check "k3s binary"       "test -f /mnt/usr/local/bin/k3s"
+              # k3s bundles containerd and runc inside the k3s binary (extracted at runtime)
+              check "k3s binary"              "test -f /mnt/usr/local/bin/k3s"
               ;;
             k0s)
-              check "k0s binary"       "test -f /mnt/usr/local/bin/k0s"
+              # k0s bundles containerd and runc inside the k0s binary (extracted at runtime)
+              check "k0s binary"              "test -f /mnt/usr/local/bin/k0s"
               ;;
           esac
 
