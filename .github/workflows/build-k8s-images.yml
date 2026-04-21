@@ -330,7 +330,7 @@ jobs:
           echo "Converting Docker image to bootable qcow2 with d2vm…"
           d2vm convert "k8s-image:${DISTRO}-${K8S_VERSION}" \
             -o "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" \
-            --size 5G \
+            --size 10G \
             --append-to-cmdline "console=ttyS0"
 
           docker rmi "k8s-image:${DISTRO}-${K8S_VERSION}" || true
