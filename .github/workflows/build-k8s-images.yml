@@ -237,6 +237,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required for creating/updating GitHub Releases
+      packages: write   # required for pushing to GHCR
       actions: read
     strategy:
       matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -254,8 +255,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up QEMU (for cross-platform builds)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # ── Build tools ───────────────────────────────────────────────────────
       - name: Install build tools
@@ -291,12 +302,15 @@ jobs:
           sudo install -m 0755 "${TMP_DIR}/d2vm" /usr/local/bin/d2vm
           d2vm --help > /dev/null
 
-      - name: Build Docker image
+      - name: Build and push multi-arch Docker image to GHCR
         uses: docker/build-push-action@v6
         with:
           context: ${{ github.workspace }}/.github/images
-          load: true
-          tags: k8s-image:${{ matrix.distro }}-${{ matrix.k8s_version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/ctnr-io/k8s-${{ matrix.distro }}:${{ matrix.k8s_version }}
+            ghcr.io/ctnr-io/k8s-${{ matrix.distro }}:${{ matrix.distro_version }}
           build-args: |
             K8S_VERSION=${{ matrix.k8s_version }}
             DISTRO=${{ matrix.distro }}
@@ -308,6 +322,11 @@ jobs:
             github_token=${{ github.token }}
           cache-from: type=gha,scope=k8s-image-${{ matrix.distro }}
           cache-to: type=gha,mode=max,scope=k8s-image-${{ matrix.distro }}
+
+      - name: Pull amd64 image locally for qcow2 conversion
+        run: |
+          docker pull --platform linux/amd64 "ghcr.io/ctnr-io/k8s-${DISTRO}:${K8S_VERSION}"
+          docker tag "ghcr.io/ctnr-io/k8s-${DISTRO}:${K8S_VERSION}" "k8s-image:${DISTRO}-${K8S_VERSION}"
 
       # ── Phase 0: size report ──────────────────────────────────────────────
       - name: Image size report
@@ -435,7 +454,8 @@ jobs:
             echo "| Kubernetes minor | \`${K8S_VERSION}\` |"
             echo "| Stable release | \`${DISTRO_VERSION}\` |"
             echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
-            echo "| Image URL    | ${IMAGE_URL:-N/A} |"
+            echo "| qcow2 Image  | ${IMAGE_URL:-N/A} |"
+            echo "| GHCR Image   | \`ghcr.io/ctnr-io/k8s-${DISTRO}:${K8S_VERSION}\` |"
             echo ""
             echo "**Pre-installed runtimes:** runc, gvisor (runsc)"
             echo ""
