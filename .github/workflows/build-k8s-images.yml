@@ -308,9 +308,7 @@ jobs:
           context: ${{ github.workspace }}/.github/images
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/ctnr-io/k8s-${{ matrix.distro }}:${{ matrix.k8s_version }}
-            ghcr.io/ctnr-io/k8s-${{ matrix.distro }}:${{ matrix.distro_version }}
+          tags: ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}
           build-args: |
             K8S_VERSION=${{ matrix.k8s_version }}
             DISTRO=${{ matrix.distro }}
@@ -325,8 +323,8 @@ jobs:
 
       - name: Pull amd64 image locally for qcow2 conversion
         run: |
-          docker pull --platform linux/amd64 "ghcr.io/ctnr-io/k8s-${DISTRO}:${K8S_VERSION}"
-          docker tag "ghcr.io/ctnr-io/k8s-${DISTRO}:${K8S_VERSION}" "k8s-image:${DISTRO}-${K8S_VERSION}"
+          docker pull --platform linux/amd64 "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}"
+          docker tag "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}" "k8s-image:${{ matrix.distro }}-${{ matrix.k8s_version }}"
 
       # ── Phase 0: size report ──────────────────────────────────────────────
       - name: Image size report
@@ -455,7 +453,7 @@ jobs:
             echo "| Stable release | \`${DISTRO_VERSION}\` |"
             echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
             echo "| qcow2 Image  | ${IMAGE_URL:-N/A} |"
-            echo "| GHCR Image   | \`ghcr.io/ctnr-io/k8s-${DISTRO}:${K8S_VERSION}\` |"
+            echo "| GHCR Image   | \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}\` |"
             echo ""
             echo "**Pre-installed runtimes:** runc, gvisor (runsc)"
             echo ""
