@@ -308,26 +308,78 @@ jobs:
           cache-from: type=gha,scope=k8s-image-${{ matrix.distro }}
           cache-to: type=gha,mode=max,scope=k8s-image-${{ matrix.distro }}
 
+      # ── Phase 0: size report ──────────────────────────────────────────────
+      - name: Image size report
+        run: |
+          {
+            echo "## Image size report: ${DISTRO}-${K8S_VERSION}"
+            echo '```'
+            docker run --rm "k8s-image:${DISTRO}-${K8S_VERSION}" sh -c \
+              'echo "=== Top directories by size ==="; \
+               du -sh /opt/* /usr/local/* /usr/bin/* /usr/lib/* 2>/dev/null | sort -h | tail -25; \
+               echo ""; \
+               echo "=== Largest installed packages ==="; \
+               dpkg-query -W -f='"'"'${Installed-Size}\t${Package}\n'"'"' 2>/dev/null | sort -n | tail -25' \
+              2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Convert Docker image to qcow2 with d2vm
         run: |
           IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}.qcow2"
           echo "Converting Docker image to bootable qcow2 with d2vm…"
           d2vm convert "k8s-image:${DISTRO}-${K8S_VERSION}" \
             -o "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" \
-            --size 8G \
+            --size 5G \
             --append-to-cmdline "console=ttyS0"
 
           docker rmi "k8s-image:${DISTRO}-${K8S_VERSION}" || true
-          ls -lh "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
+          echo "d2vm output size: $(du -sh "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" | cut -f1)"
 
+          echo "IMAGE_FILENAME=${IMAGE_FILENAME}" >> "$GITHUB_ENV"
+
+      # ── Phase 6: zero-fill free space and recompress ──────────────────────
+      - name: Zero-fill free space and recompress qcow2
+        run: |
+          set -euo pipefail
+          echo "Mounting qcow2 to zero-fill free space for better ZLIB compression…"
+          sudo modprobe nbd max_part=8
+          sudo qemu-nbd --connect=/dev/nbd0 "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
+          sleep 2
+          sudo partprobe /dev/nbd0
+          sleep 1
+
+          ROOT_PART="$(sudo lsblk -nrpo NAME,FSTYPE /dev/nbd0 \
+            | awk '$2 == "ext4" || $2 == "xfs" { print $1; exit }')"
+          if [ -z "${ROOT_PART}" ]; then
+            echo "::warning::Unable to detect root partition for zero-fill – skipping"
+            sudo qemu-nbd --disconnect /dev/nbd0 || true
+          else
+            sudo mount "${ROOT_PART}" /mnt
+            echo "Zero-filling free blocks on ${ROOT_PART}…"
+            sudo dd if=/dev/zero of=/mnt/zero.fill bs=1M 2>/dev/null || true
+            sudo rm -f /mnt/zero.fill
+            sudo sync
+            sudo umount /mnt
+            sudo qemu-nbd --disconnect /dev/nbd0
+            sleep 1
+
+            echo "Recompressing with ZLIB (qemu-img convert -c)…"
+            qemu-img convert -c -O qcow2 \
+              "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" \
+              "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}.zlib"
+            mv "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}.zlib" \
+               "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
+          fi
+
+          ls -lh "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
           IMAGE_BYTES="$(stat -c%s "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}")"
           MAX_BYTES=$((2 * 1024 * 1024 * 1024))
           if [ "${IMAGE_BYTES}" -ge "${MAX_BYTES}" ]; then
             echo "::error::Image too large: ${IMAGE_BYTES} bytes (must be < 2 GiB)"
             exit 1
           fi
-
-          echo "IMAGE_FILENAME=${IMAGE_FILENAME}" >> "$GITHUB_ENV"
+          echo "Final image size: $(numfmt --to=iec-i --suffix=B "${IMAGE_BYTES}")"
 
       - name: Publish image to GitHub Releases
         env:

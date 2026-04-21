@@ -67,18 +67,25 @@ RUN apt-get update && \
       cryptsetup \
       zstd \
       jq && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get autoremove --purge -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/apt /var/log/*.log
 
-# ── Locale / doc / cache cleanup ──────────────────────────────────────────────
-# Remove localisation data, man pages, and documentation to reduce image size.
-# None of these are needed on a headless Kubernetes node.
+# ── Locale / doc / cache / unused data cleanup ────────────────────────────────
+# Remove localisation data, man pages, documentation, and other data not needed
+# on a headless Kubernetes node to reduce image size.
 RUN rm -rf \
       /usr/share/locale/* \
       /usr/share/man/* \
       /usr/share/doc/* \
       /usr/share/info/* \
+      /usr/share/zoneinfo/posix \
+      /usr/share/zoneinfo/right \
+      /usr/share/i18n \
+      /usr/share/X11 \
       /var/cache/debconf/*-old \
       /var/cache/apt/archives/*.deb \
+      /var/cache/ldconfig/* \
       /var/log/*.log \
       /var/log/apt
 
@@ -89,7 +96,9 @@ RUN curl -fsSL https://gvisor.dev/archive.key | \
       "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/gvisor.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends runsc && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get autoremove --purge -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/apt /var/log/*.log
 
 # ── Kata Containers (hardware-isolated sandbox, requires nested virt) ──────────
 ARG TARGETARCH
@@ -132,7 +141,9 @@ RUN install -m 0755 -d /etc/apt/keyrings && \
   > /etc/apt/sources.list.d/docker.list && \
   apt-get update && \
   apt-get install -y --no-install-recommends containerd.io && \
-  rm -rf /var/lib/apt/lists/* && \
+  apt-get autoremove --purge -y && \
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/apt /var/log/*.log && \
   mkdir -p /etc/containerd && \
   cp /tmp/containerd-config.toml /etc/containerd/config.toml && \
   systemctl enable --root=/ containerd 2>/dev/null || true
@@ -146,7 +157,9 @@ RUN set -eu; \
   apt-get update; \
   apt-get install -y --no-install-recommends kubelet kubeadm kubectl; \
   apt-mark hold kubelet kubeadm kubectl; \
-  rm -rf /var/lib/apt/lists/*; \
+  apt-get autoremove --purge -y; \
+  apt-get clean; \
+  rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/apt /var/log/*.log; \
   systemctl enable --root=/ kubelet 2>/dev/null || true
 
 # ── k3s base ───────────────────────────────────────────────────────────────────
@@ -214,3 +227,22 @@ RUN set -eu; \
       < /tmp/etcd-restore.sh.tmpl > /usr/local/bin/etcd-restore.sh; \
     chmod +x /usr/local/bin/etcd-backup.sh /usr/local/bin/etcd-restore.sh; \
     rm /tmp/etcd-backup.sh.tmpl /tmp/etcd-restore.sh.tmpl
+
+# ── Final cleanup ──────────────────────────────────────────────────────────────
+# Purge build-only tools no longer needed after all repos and packages are set up,
+# configure journald for volatile storage, and remove any remaining caches/logs.
+RUN apt-get purge -y --auto-remove gnupg gpg apt-transport-https 2>/dev/null || true; \
+    apt-get clean; \
+    rm -rf \
+      /var/lib/apt/lists/* \
+      /var/cache/debconf/*-old \
+      /var/cache/apt/archives/*.deb \
+      /var/cache/ldconfig/* \
+      /var/log/apt \
+      /var/log/*.log \
+      /var/log/journal/* \
+      /tmp/* \
+      /var/tmp/*
+
+RUN mkdir -p /etc/systemd && \
+    printf '[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf
