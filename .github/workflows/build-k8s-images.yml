@@ -245,24 +245,25 @@ jobs:
           echo "Using WASM version: ${WASM_VERSION}"
 
   # ──────────────────────────────────────────────
-  # 2. Build pre-installed image per (version, distro)
+  # 2. Build pre-installed image per (version, distro, arch) — one job per arch
   # ──────────────────────────────────────────────
   build-image:
-    name: "${{ matrix.distro }} ${{ matrix.k8s_version }} (${{ matrix.distro_version }})"
+    name: "${{ matrix.distro }} ${{ matrix.k8s_version }} / ${{ matrix.arch }}"
     needs: setup-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write   # required for pushing to GHCR
       actions: read
     strategy:
-      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix_with_arch) }}
       fail-fast: true
 
     env:
       K8S_VERSION: ${{ matrix.k8s_version }}
       DISTRO: ${{ matrix.distro }}
       DISTRO_VERSION: ${{ matrix.distro_version }}
+      ARCH: ${{ matrix.arch }}
       UBUNTU_VERSION: ${{ needs.setup-matrix.outputs.ubuntu_version }}
       KATA_VERSION: ${{ needs.setup-matrix.outputs.kata_version }}
       WASM_VERSION: ${{ needs.setup-matrix.outputs.wasm_version }}
@@ -284,19 +285,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Build tools ───────────────────────────────────────────────────────
-      - name: Install build tools
+      # ── Skip if image already up-to-date ──────────────────────────────────
+      - name: Check if image needs rebuild
+        id: check-rebuild
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-utils
+          set +e
+          EXISTING_VERSION="$(skopeo inspect \
+            "docker://ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}" 2>/dev/null \
+            | jq -r '.Labels["org.opencontainers.image.version"] // ""' 2>/dev/null)"
+          set -e
+          if [ "${EXISTING_VERSION}" = "${DISTRO_VERSION}" ]; then
+            echo "::notice::ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH} already at ${DISTRO_VERSION}, skipping build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Build and push multi-arch Docker image to GHCR
+      - name: Build and push arch-specific Docker image to GHCR
+        if: steps.check-rebuild.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ github.workspace }}/.github/images
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}
+          tags: ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}-${{ matrix.arch }}
           build-args: |
             K8S_VERSION=${{ matrix.k8s_version }}
             DISTRO=${{ matrix.distro }}
@@ -304,20 +316,22 @@ jobs:
             UBUNTU_VERSION=${{ needs.setup-matrix.outputs.ubuntu_version }}
             KATA_VERSION=${{ needs.setup-matrix.outputs.kata_version }}
             WASM_VERSION=${{ needs.setup-matrix.outputs.wasm_version }}
+          labels: |
+            org.opencontainers.image.version=${{ matrix.distro_version }}
           secrets: |
             github_token=${{ github.token }}
-          cache-from: type=gha,scope=k8s-image-${{ matrix.distro }}
-          cache-to: type=gha,mode=max,scope=k8s-image-${{ matrix.distro }}
+          cache-from: type=gha,scope=k8s-image-${{ matrix.distro }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=k8s-image-${{ matrix.distro }}-${{ matrix.arch }}
 
       # ── Phase 0: size report ──────────────────────────────────────────────
-      - name: Pull amd64 image and emit size report
+      - name: Pull image and emit size report
         run: |
-          docker pull --platform linux/amd64 "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}"
-          docker tag "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}" "k8s-image:${DISTRO}-${K8S_VERSION}"
+          docker pull "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}"
+          docker tag "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}" "k8s-image:${DISTRO}-${K8S_VERSION}-${ARCH}"
           {
-            echo "## Image size report: ${DISTRO}-${K8S_VERSION}"
+            echo "## Image size report: ${DISTRO}-${K8S_VERSION}-${ARCH}"
             echo '```'
-            docker run --rm "k8s-image:${DISTRO}-${K8S_VERSION}" sh -c \
+            docker run --rm "k8s-image:${DISTRO}-${K8S_VERSION}-${ARCH}" sh -c \
               'echo "=== Top directories by size ==="; \
                du -sh /opt/* /usr/local/* /usr/bin/* /usr/lib/* 2>/dev/null | sort -h | tail -25; \
                echo ""; \
@@ -326,22 +340,23 @@ jobs:
               2>&1 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          docker rmi "k8s-image:${DISTRO}-${K8S_VERSION}" || true
+          docker rmi "k8s-image:${DISTRO}-${K8S_VERSION}-${ARCH}" || true
 
       # ── Summary ───────────────────────────────────────────────────────────
       - name: Summary
         if: always()
         run: |
           {
-            echo "### \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}\`"
+            echo "### \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}\`"
             echo ""
             echo "| Property | Value |"
             echo "| --- | --- |"
             echo "| Distribution | \`${DISTRO}\` |"
+            echo "| Architecture | \`${ARCH}\` |"
             echo "| Kubernetes minor | \`${K8S_VERSION}\` |"
             echo "| Stable release | \`${DISTRO_VERSION}\` |"
             echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
-            echo "| GHCR Image   | \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}\` |"
+            echo "| GHCR Image   | \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}\` |"
             echo ""
             echo "**Pre-installed runtimes:** runc, gvisor (runsc)"
             echo ""
@@ -353,11 +368,43 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────
-  # 3. Convert Docker image to qcow2 per architecture
+  # 3. Merge per-arch manifests into a combined multi-arch manifest
+  # ──────────────────────────────────────────────
+  merge-manifest:
+    name: "Merge manifest ${{ matrix.distro }} ${{ matrix.k8s_version }}"
+    needs: [setup-matrix, build-image]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}" \
+            "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}-amd64" \
+            "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}-arm64"
+          echo "Multi-arch manifest: ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}"
+
+  # ──────────────────────────────────────────────
+  # 4. Convert Docker image to qcow2 per architecture
   # ──────────────────────────────────────────────
   convert-qcow2:
     name: "qcow2 ${{ matrix.distro }} ${{ matrix.k8s_version }} (${{ matrix.arch }})"
-    needs: [setup-matrix, build-image]
+    needs: [setup-matrix, merge-manifest]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: write   # required for publishing to GitHub Releases
@@ -383,7 +430,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── Skip if qcow2 already up-to-date ─────────────────────────────────
+      - name: Check if qcow2 needs rebuild
+        id: check-qcow2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}-${ARCH}.qcow2"
+          echo "IMAGE_FILENAME=${IMAGE_FILENAME}" >> "$GITHUB_ENV"
+          # Check whether a release asset already exists for this combination
+          ASSET_EXISTS="$(gh release view k8s-images --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null \
+            | jq -r --arg name "${IMAGE_FILENAME}" '.assets[] | select(.name == $name) | .name' \
+            || echo '')"
+          if [ -z "${ASSET_EXISTS}" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Asset exists — check if the Docker image was built with the same DISTRO_VERSION
+          set +e
+          EXISTING_DOCKER_VERSION="$(skopeo inspect \
+            "docker://ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}" 2>/dev/null \
+            | jq -r '.Labels["org.opencontainers.image.version"] // ""' 2>/dev/null)"
+          set -e
+          if [ "${EXISTING_DOCKER_VERSION}" = "${DISTRO_VERSION}" ]; then
+            echo "::notice::${IMAGE_FILENAME} already up-to-date (${DISTRO_VERSION}), skipping conversion"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install build tools
+        if: steps.check-qcow2.outputs.skip != 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -408,13 +485,14 @@ jobs:
           d2vm --help > /dev/null
 
       - name: Pull arch-specific image from GHCR
+        if: steps.check-qcow2.outputs.skip != 'true'
         run: |
-          docker pull --platform "linux/${ARCH}" "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}"
-          docker tag "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}" "k8s-image:${DISTRO}-${K8S_VERSION}"
+          docker pull "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}"
+          docker tag "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}-${ARCH}" "k8s-image:${DISTRO}-${K8S_VERSION}"
 
       - name: Convert Docker image to qcow2 with d2vm
+        if: steps.check-qcow2.outputs.skip != 'true'
         run: |
-          IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}-${ARCH}.qcow2"
           echo "Converting Docker image to bootable qcow2 with d2vm (${ARCH})…"
           d2vm convert "k8s-image:${DISTRO}-${K8S_VERSION}" \
             -o "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" \
@@ -424,10 +502,9 @@ jobs:
           docker rmi "k8s-image:${DISTRO}-${K8S_VERSION}" || true
           echo "d2vm output size: $(du -sh "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" | cut -f1)"
 
-          echo "IMAGE_FILENAME=${IMAGE_FILENAME}" >> "$GITHUB_ENV"
-
       # ── Zero-fill free space and recompress ──────────────────────────────
       - name: Zero-fill free space and recompress qcow2
+        if: steps.check-qcow2.outputs.skip != 'true'
         run: |
           set -euo pipefail
           echo "Mounting qcow2 to zero-fill free space for better ZLIB compression…"
@@ -485,6 +562,7 @@ jobs:
           echo "Final image size: $(numfmt --to=iec-i --suffix=B "${IMAGE_BYTES}")"
 
       - name: Publish image to GitHub Releases
+        if: steps.check-qcow2.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -526,7 +604,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────
-  # 4. Smoke-test: mount the released image and verify installed software
+  # 5. Smoke-test: mount the released image and verify installed software
   # ──────────────────────────────────────────────
   smoke-test:
     name: "Smoke test ${{ matrix.k8s_version }} / ${{ matrix.distro }} / ${{ matrix.distro_version }}"
