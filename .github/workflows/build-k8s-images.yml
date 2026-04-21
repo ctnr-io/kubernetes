@@ -1,8 +1,9 @@
 name: Build Kubernetes Images
 
 # This workflow builds provider-independent Ubuntu images with the chosen
-# Kubernetes distribution (kubeadm, k3s, k0s) plus multiple container runtimes
-# (runc, gvisor/runsc, kata-containers, wasmtime, wasmedge), Longhorn/Rook-Ceph
+# Kubernetes distribution (kubeadm, k3s, k0s) plus container runtimes
+# (runc, gvisor/runsc pre-installed; kata-containers and wasmedge installed at
+# first boot by k8s-runtime-install.service before cloud-config), Longhorn/Rook-Ceph
 # storage prerequisites, and etcd backup scripts pre-installed.
 #
 # Build strategy (no KVM required):
@@ -436,7 +437,9 @@ jobs:
             echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
             echo "| Image URL    | ${IMAGE_URL:-N/A} |"
             echo ""
-            echo "**Pre-installed runtimes:** runc, gvisor (runsc), kata-containers, wasmtime, wasmedge"
+            echo "**Pre-installed runtimes:** runc, gvisor (runsc)"
+            echo ""
+            echo "**First-boot runtimes (installed by \`k8s-runtime-install.service\` before cloud-config):** kata-containers ${KATA_VERSION}, wasmedge ${WASM_VERSION}"
             echo ""
             echo "**Storage prerequisites:** lvm2, cryptsetup, open-iscsi, nfs-common (Longhorn + Rook/Ceph ready)"
             echo ""
@@ -514,8 +517,8 @@ jobs:
           # ── Container runtimes ────────────────────────────────────────────
           check "containerd shim (runc)"          "test -f /mnt/usr/bin/containerd-shim-runc-v2 || test -f /mnt/usr/local/bin/containerd-shim-runc-v2 || find /mnt -name containerd-shim-runc-v2 | grep -q ."
           check "gvisor runsc"                    "find /mnt -name runsc -o -name containerd-shim-runsc-v1 | grep -q ."
-          check "kata-containers shim"            "test -f /mnt/usr/local/bin/containerd-shim-kata-v2 || test -f /mnt/opt/kata/bin/containerd-shim-kata-v2"
-          check "wasmtime or wasmedge shim"       "find /mnt/usr/local/bin -name 'containerd-shim-wasm*' | grep -q ."
+          check "runtime install script"          "test -x /mnt/usr/local/bin/k8s-runtime-install.sh"
+          check "runtime install service enabled" "test -L /mnt/etc/systemd/system/multi-user.target.wants/k8s-runtime-install.service"
 
           # ── Kubernetes distribution ───────────────────────────────────────
           case "${DISTRO}" in

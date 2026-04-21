@@ -1,0 +1,18 @@
+[Unit]
+Description=Install Kubernetes node container runtimes (kata-containers, wasmedge)
+Documentation=https://github.com/ctnr-io/kubernetes
+After=network-online.target
+Wants=network-online.target
+Before=cloud-config.service
+ConditionPathExists=!/var/lib/k8s-runtime-install.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/k8s-runtime-install.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

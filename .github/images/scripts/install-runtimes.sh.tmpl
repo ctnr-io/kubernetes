@@ -1,0 +1,48 @@
+#!/bin/bash
+# k8s-runtime-install.sh
+# Installs heavyweight container runtimes at first boot.
+# KATA_VERSION and WASM_VERSION are substituted at image build time by envsubst.
+set -euo pipefail
+
+DONE_MARKER="/var/lib/k8s-runtime-install.done"
+
+if [ -f "${DONE_MARKER}" ]; then
+    echo "k8s-runtime-install: runtimes already installed, skipping."
+    exit 0
+fi
+
+KARCH="$(uname -m)"
+case "${KARCH}" in
+    x86_64)  DOCKER_ARCH="amd64" ; MUSL_ARCH="x86_64"  ;;
+    aarch64) DOCKER_ARCH="arm64" ; MUSL_ARCH="aarch64"  ;;
+    *)
+        echo "ERROR: unsupported architecture ${KARCH}" >&2
+        exit 1
+        ;;
+esac
+
+# ── Kata Containers ────────────────────────────────────────────────────────────
+if [ ! -f /usr/local/bin/containerd-shim-kata-v2 ]; then
+    echo "k8s-runtime-install: installing Kata Containers ${KATA_VERSION} (${DOCKER_ARCH})..."
+    curl -fsSL \
+        "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${DOCKER_ARCH}.tar.zst" \
+        | tar --zstd -xf - -C /
+    ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
+    echo "k8s-runtime-install: Kata Containers ${KATA_VERSION} installed."
+else
+    echo "k8s-runtime-install: Kata Containers already installed, skipping."
+fi
+
+# ── WasmEdge containerd shim ───────────────────────────────────────────────────
+if [ ! -f /usr/local/bin/containerd-shim-wasmedge-v1 ]; then
+    echo "k8s-runtime-install: installing WasmEdge shim ${WASM_VERSION} (${MUSL_ARCH})..."
+    curl -fsSL \
+        "https://github.com/containerd/runwasi/releases/download/containerd-shim-wasmedge%2F${WASM_VERSION}/containerd-shim-wasmedge-${MUSL_ARCH}-linux-musl.tar.gz" \
+        | tar xz -C /usr/local/bin
+    echo "k8s-runtime-install: WasmEdge shim ${WASM_VERSION} installed."
+else
+    echo "k8s-runtime-install: WasmEdge shim already installed, skipping."
+fi
+
+touch "${DONE_MARKER}"
+echo "k8s-runtime-install: all container runtimes ready."

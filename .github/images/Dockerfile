@@ -3,9 +3,9 @@
 # Kubernetes node image
 #
 # Builds on top of a plain Ubuntu base with the chosen K8s distribution,
-# multiple container runtimes (runc, gvisor/runsc, kata-containers, wasmtime,
-# wasmedge), Longhorn/Rook-Ceph storage prerequisites, and etcd backup/restore
-# scripts pre-installed.
+# multiple container runtimes (runc, gvisor/runsc pre-installed; kata-containers
+# and wasmedge installed at first boot by k8s-runtime-install.service),
+# Longhorn/Rook-Ceph storage prerequisites, and etcd backup/restore scripts.
 #
 # This image is exported and overlaid onto a bootable Ubuntu cloud image
 # (which provides the kernel, bootloader, and kernel modules).
@@ -14,15 +14,14 @@
 #   DISTRO     – kubeadm (default), k3s, k0s
 #   DISTRO_VERSION – version for k3s or k0s, e.g. v1.30 (defaults to same as K8S_VERSION)
 #   UBUNTU_VERSION – Ubuntu base version, e.g. 24.04 (default)
+#   KATA_VERSION   – kata-containers release to bake into the first-boot installer
+#   WASM_VERSION   – containerd/runwasi wasmedge release to bake into the first-boot installer
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARG UBUNTU_VERSION=24.04
 ARG K8S_VERSION
 ARG DISTRO=kubeadm
 ARG DISTRO_VERSION
-
-ARG TARGETARCH
-ARG TARGETPLATFORM
 
 FROM ubuntu:${UBUNTU_VERSION} AS base
 
@@ -99,21 +98,6 @@ RUN curl -fsSL https://gvisor.dev/archive.key | \
     apt-get autoremove --purge -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/apt /var/log/*.log
-
-# ── Kata Containers (hardware-isolated sandbox, requires nested virt) ──────────
-ARG TARGETARCH
-ARG KATA_VERSION
-ARG KATA_DOWNLOAD_URL=https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${TARGETARCH}.tar.zst
-RUN set -eu; \
-  curl -fsSL "${KATA_DOWNLOAD_URL}" | tar --zstd -xf - -C /; \
-  ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
-
-# ── WASM runtimes (wasmtime and wasmedge via containerd/runwasi) ───────────────
-ARG TARGETARCH
-ARG WASM_VERSION
-RUN set -eu; \
-  ARCH="$(echo "${TARGETARCH}" | sed 's/amd64/x86_64/;s/arm64/aarch64/')"; \
-  curl -fsSL "https://github.com/containerd/runwasi/releases/download/containerd-shim-wasmedge%2F${WASM_VERSION}/containerd-shim-wasmedge-${ARCH}-linux-musl.tar.gz" | tar xz -C /usr/local/bin
 
 # Shared config templates used by the distro-specific base stages below.
 COPY config/containerd-config.toml /tmp/containerd-config.toml
@@ -204,6 +188,8 @@ FROM ${DISTRO}-base AS final
 
 ARG K8S_VERSION
 ARG DISTRO
+ARG KATA_VERSION
+ARG WASM_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive \
   K8S_VERSION=${K8S_VERSION} \
@@ -227,6 +213,20 @@ RUN set -eu; \
       < /tmp/etcd-restore.sh.tmpl > /usr/local/bin/etcd-restore.sh; \
     chmod +x /usr/local/bin/etcd-backup.sh /usr/local/bin/etcd-restore.sh; \
     rm /tmp/etcd-backup.sh.tmpl /tmp/etcd-restore.sh.tmpl
+
+# ── First-boot runtime installer ───────────────────────────────────────────────
+# kata-containers and wasmedge are too large to embed in the image.
+# This systemd service downloads and installs them at first boot, before
+# cloud-config runs, so runtimes are ready when cloud-init configures the node.
+COPY scripts/install-runtimes.sh.tmpl /tmp/install-runtimes.sh.tmpl
+COPY config/k8s-runtime-install.service /etc/systemd/system/k8s-runtime-install.service
+RUN set -eu; \
+  KATA_VERSION="${KATA_VERSION}" WASM_VERSION="${WASM_VERSION}" \
+  envsubst '$KATA_VERSION $WASM_VERSION' \
+    < /tmp/install-runtimes.sh.tmpl > /usr/local/bin/k8s-runtime-install.sh; \
+  chmod +x /usr/local/bin/k8s-runtime-install.sh; \
+  rm /tmp/install-runtimes.sh.tmpl; \
+  systemctl enable --root=/ k8s-runtime-install.service 2>/dev/null || true
 
 # ── Final cleanup ──────────────────────────────────────────────────────────────
 # Purge build-only tools no longer needed after all repos and packages are set up,
