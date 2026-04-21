@@ -64,6 +64,7 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix_with_arch: ${{ steps.set-matrix.outputs.matrix_with_arch }}
       ubuntu_version: ${{ steps.detect-ubuntu.outputs.ubuntu_version }}
       kata_version: ${{ steps.set-matrix.outputs.kata_version }}
       wasm_version: ${{ steps.set-matrix.outputs.wasm_version }}
@@ -194,7 +195,9 @@ jobs:
           }
 
           MATRIX_FILE="$(mktemp)"
+          MATRIX_ARCH_FILE="$(mktemp)"
           : > "${MATRIX_FILE}"
+          : > "${MATRIX_ARCH_FILE}"
 
           for minor in "${K8S_MINORS[@]}"; do
             for distro in "${DISTROS[@]}"; do
@@ -211,6 +214,16 @@ jobs:
                 '{distro: $distro, k8s_version: $k8s_version, distro_version: $distro_version}' \
                 >> "${MATRIX_FILE}"
 
+              for arch in amd64 arm64; do
+                jq -nc \
+                  --arg distro "${distro}" \
+                  --arg k8s_version "${minor}" \
+                  --arg distro_version "${distro_version}" \
+                  --arg arch "${arch}" \
+                  '{distro: $distro, k8s_version: $k8s_version, distro_version: $distro_version, arch: $arch}' \
+                  >> "${MATRIX_ARCH_FILE}"
+              done
+
               echo "Selected ${distro} ${minor} -> ${distro_version}"
             done
           done
@@ -221,7 +234,10 @@ jobs:
             exit 1
           fi
 
+          MATRIX_WITH_ARCH="$(jq -sc '{include: .}' "${MATRIX_ARCH_FILE}")"
+
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "matrix_with_arch=${MATRIX_WITH_ARCH}" >> "$GITHUB_OUTPUT"
           echo "kata_version=${KATA_VERSION}" >> "$GITHUB_OUTPUT"
           echo "wasm_version=${WASM_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved matrix: ${MATRIX}"
@@ -236,7 +252,7 @@ jobs:
     needs: setup-matrix
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required for creating/updating GitHub Releases
+      contents: read
       packages: write   # required for pushing to GHCR
       actions: read
     strategy:
@@ -270,37 +286,9 @@ jobs:
 
       # ── Build tools ───────────────────────────────────────────────────────
       - name: Install build tools
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           sudo apt-get update -q
-          sudo apt-get install -y -q qemu-utils curl
-
-          ARCH="$(dpkg --print-architecture)"
-          case "${ARCH}" in
-            amd64|arm64) ;;
-            *)
-              echo "ERROR: unsupported architecture for d2vm: ${ARCH}"
-              exit 1
-              ;;
-          esac
-
-          D2VM_TAG="$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            https://api.github.com/repos/linka-cloud/d2vm/releases/latest \
-            | python3 -c 'import sys, json; print(json.load(sys.stdin)["tag_name"])')"
-          D2VM_URL="https://github.com/linka-cloud/d2vm/releases/download/${D2VM_TAG}/d2vm_${D2VM_TAG}_linux_${ARCH}.tar.gz"
-
-          echo "Installing d2vm ${D2VM_TAG} from ${D2VM_URL}"
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "${TMP_DIR}"' EXIT
-          curl --retry 3 --retry-all-errors --retry-delay 2 -fsSL \
-            -o "${TMP_DIR}/d2vm.tar.gz" "${D2VM_URL}"
-          tar -xzf "${TMP_DIR}/d2vm.tar.gz" -C "${TMP_DIR}"
-          sudo install -m 0755 "${TMP_DIR}/d2vm" /usr/local/bin/d2vm
-          d2vm --help > /dev/null
+          sudo apt-get install -y -q qemu-utils
 
       - name: Build and push multi-arch Docker image to GHCR
         uses: docker/build-push-action@v6
@@ -321,14 +309,11 @@ jobs:
           cache-from: type=gha,scope=k8s-image-${{ matrix.distro }}
           cache-to: type=gha,mode=max,scope=k8s-image-${{ matrix.distro }}
 
-      - name: Pull amd64 image locally for qcow2 conversion
-        run: |
-          docker pull --platform linux/amd64 "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}"
-          docker tag "ghcr.io/ctnr-io/${{ matrix.distro }}:${{ matrix.k8s_version }}" "k8s-image:${{ matrix.distro }}-${{ matrix.k8s_version }}"
-
       # ── Phase 0: size report ──────────────────────────────────────────────
-      - name: Image size report
+      - name: Pull amd64 image and emit size report
         run: |
+          docker pull --platform linux/amd64 "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}"
+          docker tag "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}" "k8s-image:${DISTRO}-${K8S_VERSION}"
           {
             echo "## Image size report: ${DISTRO}-${K8S_VERSION}"
             echo '```'
@@ -341,11 +326,96 @@ jobs:
               2>&1 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          docker rmi "k8s-image:${DISTRO}-${K8S_VERSION}" || true
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}\`"
+            echo ""
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Distribution | \`${DISTRO}\` |"
+            echo "| Kubernetes minor | \`${K8S_VERSION}\` |"
+            echo "| Stable release | \`${DISTRO_VERSION}\` |"
+            echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
+            echo "| GHCR Image   | \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}\` |"
+            echo ""
+            echo "**Pre-installed runtimes:** runc, gvisor (runsc)"
+            echo ""
+            echo "**First-boot runtimes (installed by \`k8s-runtime-install.service\` before cloud-config):** kata-containers ${KATA_VERSION}, wasmedge ${WASM_VERSION}"
+            echo ""
+            echo "**Storage prerequisites:** lvm2, cryptsetup, open-iscsi, nfs-common (Longhorn + Rook/Ceph ready)"
+            echo ""
+            echo "**etcd tools:** backup + restore scripts pre-installed at /usr/local/bin/ (activate daily cron via cloud-init on control-plane nodes)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────
+  # 3. Convert Docker image to qcow2 per architecture
+  # ──────────────────────────────────────────────
+  convert-qcow2:
+    name: "qcow2 ${{ matrix.distro }} ${{ matrix.k8s_version }} (${{ matrix.arch }})"
+    needs: [setup-matrix, build-image]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: write   # required for publishing to GitHub Releases
+      packages: read    # required for pulling from GHCR
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix_with_arch) }}
+      fail-fast: false
+
+    env:
+      K8S_VERSION: ${{ matrix.k8s_version }}
+      DISTRO: ${{ matrix.distro }}
+      DISTRO_VERSION: ${{ matrix.distro_version }}
+      ARCH: ${{ matrix.arch }}
+      UBUNTU_VERSION: ${{ needs.setup-matrix.outputs.ubuntu_version }}
+      KATA_VERSION: ${{ needs.setup-matrix.outputs.kata_version }}
+      WASM_VERSION: ${{ needs.setup-matrix.outputs.wasm_version }}
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install build tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-utils curl
+
+          D2VM_TAG="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            https://api.github.com/repos/linka-cloud/d2vm/releases/latest \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["tag_name"])')"
+          D2VM_URL="https://github.com/linka-cloud/d2vm/releases/download/${D2VM_TAG}/d2vm_${D2VM_TAG}_linux_${ARCH}.tar.gz"
+
+          echo "Installing d2vm ${D2VM_TAG} from ${D2VM_URL}"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TMP_DIR}"' EXIT
+          curl --retry 3 --retry-all-errors --retry-delay 2 -fsSL \
+            -o "${TMP_DIR}/d2vm.tar.gz" "${D2VM_URL}"
+          tar -xzf "${TMP_DIR}/d2vm.tar.gz" -C "${TMP_DIR}"
+          sudo install -m 0755 "${TMP_DIR}/d2vm" /usr/local/bin/d2vm
+          d2vm --help > /dev/null
+
+      - name: Pull arch-specific image from GHCR
+        run: |
+          docker pull --platform "linux/${ARCH}" "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}"
+          docker tag "ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}" "k8s-image:${DISTRO}-${K8S_VERSION}"
 
       - name: Convert Docker image to qcow2 with d2vm
         run: |
-          IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}.qcow2"
-          echo "Converting Docker image to bootable qcow2 with d2vm…"
+          IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}-${ARCH}.qcow2"
+          echo "Converting Docker image to bootable qcow2 with d2vm (${ARCH})…"
           d2vm convert "k8s-image:${DISTRO}-${K8S_VERSION}" \
             -o "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}" \
             --size 10G \
@@ -356,7 +426,7 @@ jobs:
 
           echo "IMAGE_FILENAME=${IMAGE_FILENAME}" >> "$GITHUB_ENV"
 
-      # ── Phase 6: zero-fill free space and recompress ──────────────────────
+      # ── Zero-fill free space and recompress ──────────────────────────────
       - name: Zero-fill free space and recompress qcow2
         run: |
           set -euo pipefail
@@ -439,7 +509,6 @@ jobs:
           echo "IMAGE_URL=${IMAGE_URL}" >> "$GITHUB_ENV"
           echo "Image published at: ${IMAGE_URL}"
 
-      # ── Summary ───────────────────────────────────────────────────────────
       - name: Summary
         if: always()
         run: |
@@ -449,27 +518,20 @@ jobs:
             echo "| Property | Value |"
             echo "| --- | --- |"
             echo "| Distribution | \`${DISTRO}\` |"
+            echo "| Architecture | \`${ARCH}\` |"
             echo "| Kubernetes minor | \`${K8S_VERSION}\` |"
             echo "| Stable release | \`${DISTRO_VERSION}\` |"
             echo "| Ubuntu       | \`${UBUNTU_VERSION}\` |"
             echo "| qcow2 Image  | ${IMAGE_URL:-N/A} |"
-            echo "| GHCR Image   | \`ghcr.io/ctnr-io/${DISTRO}:${K8S_VERSION}\` |"
-            echo ""
-            echo "**Pre-installed runtimes:** runc, gvisor (runsc)"
-            echo ""
-            echo "**First-boot runtimes (installed by \`k8s-runtime-install.service\` before cloud-config):** kata-containers ${KATA_VERSION}, wasmedge ${WASM_VERSION}"
-            echo ""
-            echo "**Storage prerequisites:** lvm2, cryptsetup, open-iscsi, nfs-common (Longhorn + Rook/Ceph ready)"
-            echo ""
-            echo "**etcd tools:** backup + restore scripts pre-installed at /usr/local/bin/ (activate daily cron via cloud-init on control-plane nodes)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────
-  # 3. Smoke-test: mount the released image and verify installed software
+  # 4. Smoke-test: mount the released image and verify installed software
   # ──────────────────────────────────────────────
   smoke-test:
     name: "Smoke test ${{ matrix.k8s_version }} / ${{ matrix.distro }} / ${{ matrix.distro_version }}"
-    needs: [setup-matrix, build-image]
+    needs: [setup-matrix, convert-qcow2]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -493,7 +555,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}.qcow2"
+          IMAGE_FILENAME="${DISTRO}-${K8S_VERSION}-amd64.qcow2"
           IMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/k8s-images/${IMAGE_FILENAME}"
           echo "Downloading ${IMAGE_URL}"
           curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
