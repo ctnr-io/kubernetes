@@ -231,7 +231,13 @@ RUN set -eu; \
 # ── Final cleanup ──────────────────────────────────────────────────────────────
 # Purge build-only tools no longer needed after all repos and packages are set up,
 # configure journald for volatile storage, and remove any remaining caches/logs.
-RUN apt-get purge -y --auto-remove gnupg gpg apt-transport-https 2>/dev/null || true; \
+# gnupg/gpg/apt-transport-https are only needed to add APT repositories; they are
+# not present in k3s/k0s stages (which don't add repos), so we tolerate absence.
+RUN if dpkg -l gnupg gpg apt-transport-https 2>/dev/null | grep -q '^ii'; then \
+      apt-get purge -y --auto-remove gnupg gpg apt-transport-https; \
+    else \
+      echo "INFO: build-only tools not installed in this stage, skipping purge"; \
+    fi; \
     apt-get clean; \
     rm -rf \
       /var/lib/apt/lists/* \

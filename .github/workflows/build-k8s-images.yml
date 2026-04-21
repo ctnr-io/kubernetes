@@ -345,12 +345,22 @@ jobs:
           echo "Mounting qcow2 to zero-fill free space for better ZLIB compression…"
           sudo modprobe nbd max_part=8
           sudo qemu-nbd --connect=/dev/nbd0 "${GITHUB_WORKSPACE}/${IMAGE_FILENAME}"
-          sleep 2
-          sudo partprobe /dev/nbd0
-          sleep 1
 
-          ROOT_PART="$(sudo lsblk -nrpo NAME,FSTYPE /dev/nbd0 \
-            | awk '$2 == "ext4" || $2 == "xfs" { print $1; exit }')"
+          # Wait for the NBD device and its partitions to become available
+          for i in $(seq 1 30); do
+            sudo partprobe /dev/nbd0 2>/dev/null && break
+            sleep 1
+          done
+
+          # Wait for a recognised Linux filesystem partition to appear
+          ROOT_PART=""
+          for i in $(seq 1 30); do
+            ROOT_PART="$(sudo lsblk -nrpo NAME,FSTYPE /dev/nbd0 \
+              | awk '$2 == "ext4" || $2 == "xfs" { print $1; exit }')"
+            [ -n "${ROOT_PART}" ] && break
+            sleep 1
+          done
+
           if [ -z "${ROOT_PART}" ]; then
             echo "::warning::Unable to detect root partition for zero-fill – skipping"
             sudo qemu-nbd --disconnect /dev/nbd0 || true
@@ -361,8 +371,13 @@ jobs:
             sudo rm -f /mnt/zero.fill
             sudo sync
             sudo umount /mnt
+
+            # Wait for the NBD device to be fully released before reusing it
             sudo qemu-nbd --disconnect /dev/nbd0
-            sleep 1
+            for i in $(seq 1 15); do
+              lsblk /dev/nbd0 2>/dev/null | grep -q 'nbd0' || break
+              sleep 1
+            done
 
             echo "Recompressing with ZLIB (qemu-img convert -c)…"
             qemu-img convert -c -O qcow2 \
